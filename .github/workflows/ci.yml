@@ -19,7 +19,7 @@ jobs:
       - name: Simulated test steps
         run: |
           echo "Running simulated test suite (toy)..."
-          sleep 2
+          sleep 5
           test -f README.md && echo "ok: README.md present"
           echo "All simulated tests passed."
 
