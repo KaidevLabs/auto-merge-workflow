@@ -53,7 +53,7 @@ jobs:
     if: |
       github.event_name == 'pull_request' ||
       github.event_name == 'pull_request_review' ||
-      github.event_name == 'check_run' ||
+      (github.event_name == 'check_run' && github.event.check_run.name != 'auto-merge') ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' && github.event.action == 'created' && (startsWith(github.event.comment.body, '/merge') || startsWith(github.event.comment.body, '/automerge') || startsWith(github.event.comment.body, '/remerge')))
     runs-on: ubuntu-latest
@@ -76,7 +76,7 @@ jobs:
               # Skip our own check runs to avoid a self-trigger loop.
               name=$(jq -r '.check_run.name // ""' "$GITHUB_EVENT_PATH")
               case "$name" in
-                *"Auto Merge"*) echo "Self-trigger ($name); skip." ;;
+                auto-merge|Auto\ Merge|*"Auto Merge"*) echo "Self-trigger ($name); skip." ;;
                 *) nums=$(jq -r '.check_run.check_suite.pull_requests[0].number // empty' "$GITHUB_EVENT_PATH") ;;
               esac
               ;;
@@ -191,7 +191,8 @@ jobs:
                 *) echo "  wait $cname ($cstatus)"; pending=1 ;;
               esac
             done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$head/check-runs" \
-                        --jq '.check_runs[] | [.name,.status,(.conclusion // "")] | @tsv' 2>/dev/null || true)
+                        --arg runid "$GITHUB_RUN_ID" \
+                        --jq '.check_runs[] | select((.html_url | contains("/" + $runid + "/")) | not) | [.name,.status,(.conclusion // "")] | @tsv' 2>/dev/null || true)
             [ "$pending" -eq 0 ] || { echo "Checks pending; will retry on next check_run."; echo "::endgroup::"; return 0; }
             [ "$failed" -eq 0 ] || { echo "Checks failing; not merging."; echo "::endgroup::"; return 0; }
 
