@@ -16,15 +16,14 @@ Any **non-draft** PR targeting `dev` or `main` is merged automatically once
 **all** of these gates pass:
 
 1. **Every check run on the PR head is green** (or `skipped`/`neutral`).
-2. **≥ `AUTO_MERGE_MIN_APPROVALS` approving reviews** (repo variable, default
-   `1`), and no `CHANGES_REQUESTED`.
+2. **At least as many approving reviews as the base branch requires** — read
+   from the branch's ruleset / branch protection — and no `CHANGES_REQUESTED`.
 3. **No unresolved review threads.**
 4. **Mergeable.** If the head is `BEHIND` the base, the branch is auto-updated
    and re-evaluated. If it has conflicts (`DIRTY`), a comment is posted asking
    for manual resolution.
 
-There is **no opt-in label**: an approved, green, non-draft PR just merges.
-To **hold** a PR, add the **`no-auto-merge`** label (opt-out).
+There is no opt-in label: an approved, green, non-draft PR just merges.
 
 ## Triggers
 
@@ -34,33 +33,35 @@ anything:
 - a review is submitted (approval kicks off the merge)
 - any check run completes (`check_run`)
 - new commit pushed (`synchronize`)
-- draft → ready (`ready_for_review`), reopened, labelled/unlabelled
-- **manual**: comment `/merge` on the PR (admin/maintainer only), or run the
-  workflow manually from the Actions tab with a PR number
+- draft → ready (`ready_for_review`), reopened
+- **manual**: comment `/merge` on the PR (admin/maintainer), `/merge-force`
+  (admin only — merges ignoring all gates), or run the workflow manually from
+  the Actions tab with a PR number
 
 ## Error handling
 
 - **Conflicts** → comment posted (once); fix, push, or comment `/merge`.
 - **Branch behind base** → auto-updated; if that fails, a comment is posted.
-- **Merge command fails** (e.g. branch protection) → comment posted with the
-  error; fix the cause and `/merge` to retry.
+- **Merge command fails** (e.g. branch protection) → a comment is posted (the
+  error stays out of the comment and logs); fix the cause and `/merge` to retry.
 - **Checks fail** → nothing merges; push a fix and the next `check_run` retries.
 - **Checks pending** → the workflow exits and is re-triggered when checks finish.
 
 ## Setup (one-time)
 
-1. **Create the `no-auto-merge` label** (optional — the hold escape hatch).
-2. **Drop the workflow in**: copy `.github/workflows/auto-merge.yml` to your
+1. **Drop the workflow in**: copy `.github/workflows/auto-merge.yml` to your
    repo. It uses the default `GITHUB_TOKEN` — no secrets needed.
-3. **(Optional) set `AUTO_MERGE_MIN_APPROVALS`** repo variable to change the
-   number of required approvals (default `1`). Set to `0` in a toy repo to test
-   the mechanics without a second approver.
-4. **(Recommended) rulesets as a backstop** so the manual merge button can't
+2. **(Optional) set an `ADMIN_TOKEN` secret** if you want `/merge-force` to
+   work — the token must have admin rights to bypass branch protection.
+3. **(Recommended) rulesets as a backstop** so the manual merge button can't
    bypass the gates. In Settings → Rules → Rulesets, for `main` and `dev`:
    - `pull_request` rule: `required_approving_review_count: 1`,
      `required_review_thread_resolution: true`, and `allowed_merge_methods`:
      `["merge"]` for `main`, `["squash"]` for `dev`.
    - `required_status_checks`: your CI job names.
+
+The workflow reads the required approval count from the branch's ruleset (or
+legacy branch protection), so no separate variable is needed.
 
 ## Caveat
 
@@ -77,7 +78,7 @@ The branch layout used here: `main` (default), `dev`, and feature branches.
 feature/x  --(PR, squash)-->  dev  --(PR, merge commit)-->  main
 ```
 
-`AUTO_MERGE_MIN_APPROVALS` is set to `0` here so PRs merge without an approval
-(you can't approve your own PRs). Open a PR to `dev`, mark it ready, and the
-workflow merges it as a squash; open a PR from `dev` to `main` and it merges as
-a merge commit.
+The required approval count comes from the `dev`/`main` rulesets, which here
+require none (you can't approve your own PRs). Open a PR to `dev`, mark it
+ready, and the workflow merges it as a squash; open a PR from `dev` to `main`
+and it merges as a merge commit.
