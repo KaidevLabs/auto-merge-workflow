@@ -60,10 +60,7 @@ concurrency:
 jobs:
   auto-merge:
     if: |
-      github.event_name == 'pull_request' ||
-      github.event_name == 'pull_request_review' ||
-      (github.event_name == 'check_run' && github.event.check_run.name != 'auto-merge') ||
-      github.event_name == 'workflow_dispatch' ||
+      github.event_name != 'issue_comment' ||
       (github.event_name == 'issue_comment' && github.event.action == 'created' && (startsWith(github.event.comment.body, '/merge') || startsWith(github.event.comment.body, '/automerge')))
     runs-on: ubuntu-latest
     steps:
