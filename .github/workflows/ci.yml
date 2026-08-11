@@ -1,0 +1,55 @@
+name: Simulated CI
+
+# Toy CI that MUST pass before the Auto Merge workflow will merge a PR.
+# This simulates a real test suite so we can exercise the "all checks green"
+# gate of .github/workflows/auto-merge.yml.
+#
+# Pass/fail is controlled by a repo variable:
+#   - SIMULATED_CI_FAIL not set / "false"  -> tests PASS
+#   - SIMULATED_CI_FAIL = "true"           -> tests FAIL (to demo the block)
+
+on:
+  pull_request:
+    branches: [dev, main]
+    types: [opened, synchronize, ready_for_review, reopened]
+
+jobs:
+  simulated-tests:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    env:
+      SIMULATED_CI_FAIL: ${{ vars.SIMULATED_CI_FAIL || 'false' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Simulated test steps
+        id: tests
+        run: |
+          echo "Running simulated test suite (toy)..."
+          sleep 2
+
+          echo "Checking that the repository layout is valid..."
+          test -f README.md && echo "  ok: README.md present"
+
+          SHOULD_FAIL="${SIMULATED_CI_FAIL:-false}"
+          if [ "$SHOULD_FAIL" = "true" ]; then
+            echo "??? Simulated test FAILED (SIMULATED_CI_FAIL=true)"
+            exit 1
+          fi
+
+          echo "All simulated tests passed."
+
+  test-summary:
+    if: ${{ !github.event.pull_request.draft }}
+    needs: simulated-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if tests failed
+        if: needs.simulated-tests.result != 'success'
+        run: |
+          echo "??? Simulated CI failed; auto-merge will be blocked."
+          exit 1
+      - name: Passed
+        if: needs.simulated-tests.result == 'success'
+        run: echo "✅ Simulated CI passed."
