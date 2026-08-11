@@ -1,9 +1,10 @@
 name: Auto Merge
 
-# Opt a PR in by adding the `ready-to-merge` label. Once labelled, the PR is
-# merged automatically when ALL of these are true:
+# Any non-draft PR targeting `dev` or `main` is merged automatically once ALL
+# of these are true:
 #   - every check run on the PR head is green (or skipped/neutral)
-#   - there is >=1 approving review and no CHANGES_REQUESTED
+#   - there are >= AUTO_MERGE_MIN_APPROVALS approving reviews and no
+#     CHANGES_REQUESTED
 #   - no unresolved review threads
 #   - the PR is mergeable (branch auto-updated when behind; conflicts surfaced)
 #
@@ -11,19 +12,18 @@ name: Auto Merge
 #   - dev  -> squash
 #   - main -> merge commit
 #
+# Hold a PR from merging by adding the `no-auto-merge` label (opt-out).
+#
 # Triggers (re-evaluate on any relevant state change):
-#   - pull_request: labelled / synchronize / ready_for_review / reopened
+#   - pull_request: synchronize / ready_for_review / reopened / labeled / unlabeled
 #   - pull_request_review: submitted        (approval also kicks off the merge)
 #   - check_run: completed                  (re-evaluates as checks finish)
 #   - issue_comment: `/merge` comment       (admin/maintainer manual re-trigger)
 #   - workflow_dispatch: PR number input    (manual re-trigger from Actions tab)
-#
-# The `ready-to-merge` label is only removed on a successful merge, so its
-# presence on an open PR means "still waiting / not yet mergeable".
 
 on:
   pull_request:
-    types: [labeled, synchronize, ready_for_review, reopened]
+    types: [synchronize, ready_for_review, reopened, labeled, unlabeled]
   pull_request_review:
     types: [submitted]
   check_run:
@@ -108,6 +108,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           NUMS: ${{ steps.pr.outputs.nums }}
+          # Repo variable AUTO_MERGE_MIN_APPROVALS; default 1. Set to 0 in the
+          # toy repo to test the mechanics without a second approver.
+          MIN_APPROVALS: ${{ vars.AUTO_MERGE_MIN_APPROVALS || '1' }}
         run: |
           set +e -uo pipefail
 
@@ -138,16 +141,12 @@ jobs:
 
             state=$(gh pr view "$pr" --json state,isDraft --jq '[.state,.isDraft]|@tsv')
             read -r state isdraft <<< "$state"
-            if [ "$state" = "MERGED" ] || [ "$state" = "CLOSED" ]; then
-              echo "PR is $state; cleaning up label."
-              gh pr edit "$pr" --remove-label "ready-to-merge" 2>/dev/null || true
-              echo "::endgroup::"; return 0
-            fi
-            [ "$state" = "OPEN" ] || { echo "::endgroup::"; return 0; }
+            [ "$state" = "OPEN" ] || { echo "PR is $state; skip."; echo "::endgroup::"; return 0; }
             [ "$isdraft" = "false" ] || { echo "Draft; skip."; echo "::endgroup::"; return 0; }
 
-            if ! gh pr view "$pr" --json labels --jq '.labels[].name' 2>/dev/null | grep -qx "ready-to-merge"; then
-              echo "No 'ready-to-merge' label; skip."; echo "::endgroup::"; return 0
+            # Opt-out: skip PRs explicitly held with the no-auto-merge label.
+            if gh pr view "$pr" --json labels --jq '.labels[].name' 2>/dev/null | grep -qx "no-auto-merge"; then
+              echo "Held by 'no-auto-merge' label; skip."; echo "::endgroup::"; return 0
             fi
 
             head=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
@@ -159,7 +158,7 @@ jobs:
             case "$mss" in
               DIRTY)
                 echo "Conflicts; needs manual resolution."
-                post_once "$pr" "conflict" "⚠️ Auto-merge is blocked: this PR has merge conflicts. Resolve them, push, and re-add the \`ready-to-merge\` label (or comment \`/merge\`)."
+                post_once "$pr" "conflict" "⚠️ Auto-merge is blocked: this PR has merge conflicts. Resolve them and push, or comment \`/merge\`."
                 echo "::endgroup::"; return 0
                 ;;
               BEHIND)
@@ -196,7 +195,7 @@ jobs:
             [ "$pending" -eq 0 ] || { echo "Checks pending; will retry on next check_run."; echo "::endgroup::"; return 0; }
             [ "$failed" -eq 0 ] || { echo "Checks failing; not merging."; echo "::endgroup::"; return 0; }
 
-            # Gate 2: >=1 approval, 0 changes requested.
+            # Gate 2: >= MIN_APPROVALS approvals, 0 changes requested.
             local approved=0 changes=0
             while read -r s; do
               case "$s" in
@@ -205,7 +204,7 @@ jobs:
               esac
             done < <(gh pr view "$pr" --json reviews --jq '.reviews[].state' 2>/dev/null || true)
             [ "$changes" -eq 0 ] || { echo "Changes requested; not merging."; echo "::endgroup::"; return 0; }
-            [ "$approved" -ge 1 ] || { echo "No approvals yet; not merging."; echo "::endgroup::"; return 0; }
+            [ "$approved" -ge "$MIN_APPROVALS" ] || { echo "Only $approved approval(s); need $MIN_APPROVALS; not merging."; echo "::endgroup::"; return 0; }
 
             # Gate 3: no unresolved review threads (GraphQL; REST has no threads endpoint).
             local unresolved
@@ -219,7 +218,6 @@ jobs:
             case "$headref" in dev|main) ;; *) del="--delete-branch" ;; esac
             local err
             if err=$(gh pr merge "$pr" --"$method" $del 2>&1); then
-              gh pr edit "$pr" --remove-label "ready-to-merge" 2>/dev/null || true
               echo "✅ Merged PR #$pr ($method)."
             else
               echo "❌ Merge failed: $err"
