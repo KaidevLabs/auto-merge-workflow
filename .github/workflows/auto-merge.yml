@@ -1,0 +1,237 @@
+name: Auto Merge
+
+# Opt a PR in by adding the `ready-to-merge` label. Once labelled, the PR is
+# merged automatically when ALL of these are true:
+#   - every check run on the PR head is green (or skipped/neutral)
+#   - there is >=1 approving review and no CHANGES_REQUESTED
+#   - no unresolved review threads
+#   - the PR is mergeable (branch auto-updated when behind; conflicts surfaced)
+#
+# Merge method is derived from the base branch:
+#   - dev  -> squash
+#   - main -> merge commit
+#
+# Triggers (re-evaluate on any relevant state change):
+#   - pull_request: labelled / synchronize / ready_for_review / reopened
+#   - pull_request_review: submitted        (approval also kicks off the merge)
+#   - check_run: completed                  (re-evaluates as checks finish)
+#   - issue_comment: `/merge` comment       (admin/maintainer manual re-trigger)
+#   - workflow_dispatch: PR number input    (manual re-trigger from Actions tab)
+#
+# The `ready-to-merge` label is only removed on a successful merge, so its
+# presence on an open PR means "still waiting / not yet mergeable".
+
+on:
+  pull_request:
+    types: [labeled, synchronize, ready_for_review, reopened]
+  pull_request_review:
+    types: [submitted]
+  check_run:
+    types: [completed]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to evaluate"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+concurrency:
+  # Per-PR group so different PRs evaluate in parallel; stale evaluations for
+  # the same PR are cancelled by newer ones.
+  group: auto-merge-${{ github.event.pull_request.number || github.event.check_run.check_suite.pull_requests[0].number || github.event.issue.number || inputs.pr_number || 'adhoc' }}
+  cancel-in-progress: true
+
+jobs:
+  auto-merge:
+    if: |
+      github.event_name == 'pull_request' ||
+      github.event_name == 'pull_request_review' ||
+      github.event_name == 'check_run' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' && github.event.action == 'created' && (startsWith(github.event.comment.body, '/merge') || startsWith(github.event.comment.body, '/automerge') || startsWith(github.event.comment.body, '/remerge')))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve PR number(s) to evaluate
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          PR_INPUT: ${{ inputs.pr_number }}
+        run: |
+          set +e -uo pipefail
+          nums=""
+          case "$EVENT" in
+            pull_request|pull_request_review)
+              nums=$(jq -r '.pull_request.number // empty' "$GITHUB_EVENT_PATH")
+              ;;
+            check_run)
+              # Skip our own check runs to avoid a self-trigger loop.
+              name=$(jq -r '.check_run.name // ""' "$GITHUB_EVENT_PATH")
+              case "$name" in
+                *"Auto Merge"*) echo "Self-trigger ($name); skip." ;;
+                *) nums=$(jq -r '.check_run.check_suite.pull_requests[0].number // empty' "$GITHUB_EVENT_PATH") ;;
+              esac
+              ;;
+            issue_comment)
+              # Only comments on PRs (not issues).
+              is_pr=$(jq -r '.issue.pull_request != null' "$GITHUB_EVENT_PATH")
+              if [ "$is_pr" != "true" ]; then
+                echo "Comment not on a PR; skip."
+                echo "nums=" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              commenter=$(jq -r '.comment.user.login' "$GITHUB_EVENT_PATH")
+              perm=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$commenter/permission" --jq .permission 2>/dev/null || echo none)
+              case "$perm" in
+                admin|maintain) nums=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH") ;;
+                *) echo "Commenter $commenter ($perm) not authorised to /merge; skip." ;;
+              esac
+              ;;
+            workflow_dispatch)
+              nums="$PR_INPUT"
+              [[ "$nums" =~ ^[0-9]+$ ]] || { echo "Invalid pr_number input '$nums'."; nums=""; }
+              ;;
+          esac
+          echo "Resolved PRs: ${nums:-<none>}"
+          echo "nums=$nums" >> "$GITHUB_OUTPUT"
+
+      - name: Evaluate and merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          NUMS: ${{ steps.pr.outputs.nums }}
+        run: |
+          set +e -uo pipefail
+
+          owner=${GITHUB_REPOSITORY%%/*}
+          name=${GITHUB_REPOSITORY#*/}
+
+          # Post a PR comment only if one with the same marker doesn't already exist.
+          post_once() {
+            local pr="$1" marker="$2" body="$3"
+            if gh pr view "$pr" --json comments --jq '.comments[].body' 2>/dev/null \
+               | grep -q "<!-- auto-merge:$marker -->"; then
+              return 0
+            fi
+            gh pr comment "$pr" --body "<!-- auto-merge:$marker -->
+          $body" 2>/dev/null || true
+          }
+
+          evaluate() {
+            local pr="$1"
+            echo "::group::PR #$pr"
+            local base head headref state isdraft method
+            base=$(gh pr view "$pr" --json baseRefName --jq .baseRefName)
+            case "$base" in
+              dev)  method=squash ;;
+              main) method=merge ;;
+              *)    echo "Base '$base' not managed by auto-merge; skip."; echo "::endgroup::"; return 0 ;;
+            esac
+
+            state=$(gh pr view "$pr" --json state,isDraft --jq '[.state,.isDraft]|@tsv')
+            read -r state isdraft <<< "$state"
+            if [ "$state" = "MERGED" ] || [ "$state" = "CLOSED" ]; then
+              echo "PR is $state; cleaning up label."
+              gh pr edit "$pr" --remove-label "ready-to-merge" 2>/dev/null || true
+              echo "::endgroup::"; return 0
+            fi
+            [ "$state" = "OPEN" ] || { echo "::endgroup::"; return 0; }
+            [ "$isdraft" = "false" ] || { echo "Draft; skip."; echo "::endgroup::"; return 0; }
+
+            if ! gh pr view "$pr" --json labels --jq '.labels[].name' 2>/dev/null | grep -qx "ready-to-merge"; then
+              echo "No 'ready-to-merge' label; skip."; echo "::endgroup::"; return 0
+            fi
+
+            head=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
+            headref=$(gh pr view "$pr" --json headRefName --jq .headRefName)
+
+            # Mergeability: handle conflicts / behind / unknown before gating.
+            local mss
+            mss=$(gh pr view "$pr" --json mergeStateStatus --jq .mergeStateStatus)
+            case "$mss" in
+              DIRTY)
+                echo "Conflicts; needs manual resolution."
+                post_once "$pr" "conflict" "⚠️ Auto-merge is blocked: this PR has merge conflicts. Resolve them, push, and re-add the \`ready-to-merge\` label (or comment \`/merge\`)."
+                echo "::endgroup::"; return 0
+                ;;
+              BEHIND)
+                echo "Head is behind base; updating branch."
+                if gh pr update-branch "$pr" --merge 2>/dev/null; then
+                  echo "Branch updated; synchronize will re-trigger."
+                else
+                  post_once "$pr" "behind" "⚠️ Auto-merge could not update this branch (behind base). Update it manually, then comment \`/merge\`."
+                fi
+                echo "::endgroup::"; return 0
+                ;;
+              UNKNOWN)
+                echo "Merge state unknown (GitHub computing); will retry on next event."
+                echo "::endgroup::"; return 0
+                ;;
+            esac
+
+            # Gate 1: every check run on the head SHA must be green/skipped/neutral.
+            local pending=0 failed=0
+            while IFS=$'\t' read -r cname cstatus cconcl; do
+              [ -n "$cname" ] || continue
+              case "$cstatus" in
+                completed)
+                  case "$cconcl" in
+                    success|skipped|neutral) echo "  ok   $cname" ;;
+                    *) echo "  fail $cname ($cconcl)"; failed=1 ;;
+                  esac
+                  ;;
+                *) echo "  wait $cname ($cstatus)"; pending=1 ;;
+              esac
+            done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$head/check-runs" \
+                        --jq '.check_runs[] | [.name,.status,(.conclusion // "")] | @tsv' 2>/dev/null || true)
+            [ "$pending" -eq 0 ] || { echo "Checks pending; will retry on next check_run."; echo "::endgroup::"; return 0; }
+            [ "$failed" -eq 0 ] || { echo "Checks failing; not merging."; echo "::endgroup::"; return 0; }
+
+            # Gate 2: >=1 approval, 0 changes requested.
+            local approved=0 changes=0
+            while read -r s; do
+              case "$s" in
+                APPROVED) approved=$((approved+1)) ;;
+                CHANGES_REQUESTED) changes=$((changes+1)) ;;
+              esac
+            done < <(gh pr view "$pr" --json reviews --jq '.reviews[].state' 2>/dev/null || true)
+            [ "$changes" -eq 0 ] || { echo "Changes requested; not merging."; echo "::endgroup::"; return 0; }
+            [ "$approved" -ge 1 ] || { echo "No approvals yet; not merging."; echo "::endgroup::"; return 0; }
+
+            # Gate 3: no unresolved review threads (GraphQL; REST has no threads endpoint).
+            local unresolved
+            unresolved=$(gh api graphql -f query="query{repository(owner:\"$owner\",name:\"$name\"){pullRequest(number:$pr){reviewThreads(first:100){nodes{isResolved}}}}}" \
+              --jq '.data.repository.pullRequest.reviewThreads.nodes | map(select(.isResolved == false)) | length' 2>/dev/null || echo 0)
+            [ "$unresolved" -eq 0 ] || { echo "$unresolved unresolved thread(s); not merging."; echo "::endgroup::"; return 0; }
+
+            # All gates passed: merge.
+            echo "All gates passed; merging with method '$method'."
+            local del=""
+            case "$headref" in dev|main) ;; *) del="--delete-branch" ;; esac
+            local err
+            if err=$(gh pr merge "$pr" --"$method" $del 2>&1); then
+              gh pr edit "$pr" --remove-label "ready-to-merge" 2>/dev/null || true
+              echo "✅ Merged PR #$pr ($method)."
+            else
+              echo "❌ Merge failed: $err"
+              post_once "$pr" "merge-failed" "❌ Auto-merge could not merge this PR:
+          \`\`\`
+          $err
+          \`\`\`
+          Resolve the issue and comment \`/merge\` to retry."
+            fi
+            echo "::endgroup::"
+          }
+
+          [ -n "$NUMS" ] || { echo "No PRs to evaluate."; exit 0; }
+          for n in $NUMS; do
+            evaluate "$n" || true
+          done
