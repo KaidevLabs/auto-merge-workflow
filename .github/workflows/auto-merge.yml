@@ -3,19 +3,22 @@ name: Auto Merge
 # Any non-draft PR targeting `dev` or `main` is merged automatically once ALL
 # of these are true:
 #   - every check run on the PR head is green (or skipped/neutral)
-#   - there are >= AUTO_MERGE_MIN_APPROVALS approving reviews and no
+#   - the PR has at least as many approvals as the base branch requires
+#     (read from the branch's ruleset / branch protection), and no
 #     CHANGES_REQUESTED
 #   - no unresolved review threads
 #   - the PR is mergeable (branch auto-updated when behind; conflicts surfaced)
+#
+# The required approval count is NOT hardcoded: it is read from the base
+# branch's ruleset (or legacy branch protection), so it always matches the
+# repo's own configuration.
 #
 # Merge method is derived from the base branch:
 #   - dev  -> squash
 #   - main -> merge commit
 #
-# Hold a PR from merging by adding the `no-auto-merge` label (opt-out).
-#
 # Triggers (re-evaluate on any relevant state change):
-#   - pull_request: synchronize / ready_for_review / reopened / labeled / unlabeled
+#   - pull_request: synchronize / ready_for_review / reopened
 #   - pull_request_review: submitted        (approval also kicks off the merge)
 #   - check_run: completed                  (re-evaluates as checks finish)
 #   - issue_comment: `/merge` comment       (admin/maintainer manual re-trigger)
@@ -23,7 +26,7 @@ name: Auto Merge
 
 on:
   pull_request:
-    types: [synchronize, ready_for_review, reopened, labeled, unlabeled]
+    types: [synchronize, ready_for_review, reopened]
   pull_request_review:
     types: [submitted]
   check_run:
@@ -108,9 +111,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           NUMS: ${{ steps.pr.outputs.nums }}
-          # Repo variable AUTO_MERGE_MIN_APPROVALS; default 1. Set to 0 in the
-          # toy repo to test the mechanics without a second approver.
-          MIN_APPROVALS: ${{ vars.AUTO_MERGE_MIN_APPROVALS || '1' }}
         run: |
           set +e -uo pipefail
 
@@ -128,6 +128,19 @@ jobs:
           $body" 2>/dev/null || true
           }
 
+          # Required approving reviews for a branch, read from the repo config:
+          # rulesets (max across them) with a legacy branch-protection fallback.
+          min_approvals() {
+            local branch="$1" r b
+            r=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$branch" \
+                --jq '[.[] | select(.type=="pull_request") | (.parameters.required_approving_review_count // 0)] | (if length>0 then max else 0 end)' 2>/dev/null)
+            case "$r" in ''|*[!0-9]*) r=0 ;; esac
+            b=$(gh api "repos/$GITHUB_REPOSITORY/branches/$branch/protection" \
+                --jq '.required_pull_request_reviews.required_approving_review_count // 0' 2>/dev/null)
+            case "$b" in ''|*[!0-9]*) b=0 ;; esac
+            if [ "$r" -ge "$b" ]; then echo "$r"; else echo "$b"; fi
+          }
+
           evaluate() {
             local pr="$1"
             echo "::group::PR #$pr"
@@ -143,11 +156,6 @@ jobs:
             read -r state isdraft <<< "$state"
             [ "$state" = "OPEN" ] || { echo "PR is $state; skip."; echo "::endgroup::"; return 0; }
             [ "$isdraft" = "false" ] || { echo "Draft; skip."; echo "::endgroup::"; return 0; }
-
-            # Opt-out: skip PRs explicitly held with the no-auto-merge label.
-            if gh pr view "$pr" --json labels --jq '.labels[].name' 2>/dev/null | grep -qx "no-auto-merge"; then
-              echo "Held by 'no-auto-merge' label; skip."; echo "::endgroup::"; return 0
-            fi
 
             head=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
             headref=$(gh pr view "$pr" --json headRefName --jq .headRefName)
@@ -195,8 +203,9 @@ jobs:
             [ "$pending" -eq 0 ] || { echo "Checks pending; will retry on next check_run."; echo "::endgroup::"; return 0; }
             [ "$failed" -eq 0 ] || { echo "Checks failing; not merging."; echo "::endgroup::"; return 0; }
 
-            # Gate 2: >= MIN_APPROVALS approvals, 0 changes requested.
-            local approved=0 changes=0
+            # Gate 2: approvals >= what the base branch requires, 0 changes requested.
+            local minappr approved=0 changes=0
+            minappr=$(min_approvals "$base")
             while read -r s; do
               case "$s" in
                 APPROVED) approved=$((approved+1)) ;;
@@ -204,7 +213,7 @@ jobs:
               esac
             done < <(gh pr view "$pr" --json reviews --jq '.reviews[].state' 2>/dev/null || true)
             [ "$changes" -eq 0 ] || { echo "Changes requested; not merging."; echo "::endgroup::"; return 0; }
-            [ "$approved" -ge "$MIN_APPROVALS" ] || { echo "Only $approved approval(s); need $MIN_APPROVALS; not merging."; echo "::endgroup::"; return 0; }
+            [ "$approved" -ge "$minappr" ] || { echo "Only $approved approval(s); need $minappr; not merging."; echo "::endgroup::"; return 0; }
 
             # Gate 3: no unresolved review threads (GraphQL; REST has no threads endpoint).
             local unresolved
