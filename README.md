@@ -12,35 +12,35 @@ This toy repo exists to test the workflow before it ships to a real project.
 
 ## How it works
 
-Add the **`ready-to-merge`** label to a PR targeting `dev` or `main`. The
-workflow then merges it automatically once **all** of these gates pass:
+Any **non-draft** PR targeting `dev` or `main` is merged automatically once
+**all** of these gates pass:
 
 1. **Every check run on the PR head is green** (or `skipped`/`neutral`).
-2. **≥1 approving review**, and no `CHANGES_REQUESTED`.
+2. **≥ `AUTO_MERGE_MIN_APPROVALS` approving reviews** (repo variable, default
+   `1`), and no `CHANGES_REQUESTED`.
 3. **No unresolved review threads.**
 4. **Mergeable.** If the head is `BEHIND` the base, the branch is auto-updated
    and re-evaluated. If it has conflicts (`DIRTY`), a comment is posted asking
    for manual resolution.
 
-The `ready-to-merge` label is removed only on a **successful** merge, so its
-presence on an open PR means "still waiting".
+There is **no opt-in label**: an approved, green, non-draft PR just merges.
+To **hold** a PR, add the **`no-auto-merge`** label (opt-out).
 
 ## Triggers
 
-The workflow re-evaluates on any relevant change — you rarely need to do
-anything beyond labelling:
+The workflow re-evaluates on any relevant change, so you rarely need to do
+anything:
 
-- `ready-to-merge` label added
-- new commit pushed (`synchronize`)
-- draft → ready (`ready_for_review`)
-- a review is submitted (approval also kicks off the merge)
+- a review is submitted (approval kicks off the merge)
 - any check run completes (`check_run`)
+- new commit pushed (`synchronize`)
+- draft → ready (`ready_for_review`), reopened, labelled/unlabelled
 - **manual**: comment `/merge` on the PR (admin/maintainer only), or run the
   workflow manually from the Actions tab with a PR number
 
 ## Error handling
 
-- **Conflicts** → comment posted (once); fix, push, re-label or `/merge`.
+- **Conflicts** → comment posted (once); fix, push, or comment `/merge`.
 - **Branch behind base** → auto-updated; if that fails, a comment is posted.
 - **Merge command fails** (e.g. branch protection) → comment posted with the
   error; fix the cause and `/merge` to retry.
@@ -49,10 +49,13 @@ anything beyond labelling:
 
 ## Setup (one-time)
 
-1. **Create the label**: `ready-to-merge`.
+1. **Create the `no-auto-merge` label** (optional — the hold escape hatch).
 2. **Drop the workflow in**: copy `.github/workflows/auto-merge.yml` to your
-   repo. The workflow uses the default `GITHUB_TOKEN` — no secrets needed.
-3. **(Recommended) rulesets as a backstop** so the manual merge button can't
+   repo. It uses the default `GITHUB_TOKEN` — no secrets needed.
+3. **(Optional) set `AUTO_MERGE_MIN_APPROVALS`** repo variable to change the
+   number of required approvals (default `1`). Set to `0` in a toy repo to test
+   the mechanics without a second approver.
+4. **(Recommended) rulesets as a backstop** so the manual merge button can't
    bypass the gates. In Settings → Rules → Rulesets, for `main` and `dev`:
    - `pull_request` rule: `required_approving_review_count: 1`,
      `required_review_thread_resolution: true`, and `allowed_merge_methods`:
@@ -74,9 +77,7 @@ The branch layout used here: `main` (default), `dev`, and feature branches.
 feature/x  --(PR, squash)-->  dev  --(PR, merge commit)-->  main
 ```
 
-1. Create a feature branch off `dev`, push a change, open a PR to `dev`.
-2. Add the `ready-to-merge` label.
-3. Approve it (or have a maintainer approve).
-4. Watch the workflow merge it (squash into `dev`).
-5. Open a PR from `dev` to `main`, label + approve, and it merges as a merge
-   commit.
+`AUTO_MERGE_MIN_APPROVALS` is set to `0` here so PRs merge without an approval
+(you can't approve your own PRs). Open a PR to `dev`, mark it ready, and the
+workflow merges it as a squash; open a PR from `dev` to `main` and it merges as
+a merge commit.
