@@ -17,11 +17,17 @@ name: Auto Merge
 #   - dev  -> squash
 #   - main -> merge commit
 #
+# Comment commands on a PR:
+#   - /merge        re-check and merge if all gates pass (admin/maintainer)
+#   - /merge-force  merge immediately, ignoring all gates (admin only)
+#
+# The workflow posts an intro summary comment on each managed PR.
+#
 # Triggers (re-evaluate on any relevant state change):
 #   - pull_request: synchronize / ready_for_review / reopened
 #   - pull_request_review: submitted        (approval also kicks off the merge)
 #   - check_run: completed                  (re-evaluates as checks finish)
-#   - issue_comment: `/merge` comment       (admin/maintainer manual re-trigger)
+#   - issue_comment: /merge* comment        (manual re-trigger)
 #   - workflow_dispatch: PR number input    (manual re-trigger from Actions tab)
 
 on:
@@ -58,7 +64,7 @@ jobs:
       github.event_name == 'pull_request_review' ||
       (github.event_name == 'check_run' && github.event.check_run.name != 'auto-merge') ||
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'issue_comment' && github.event.action == 'created' && (startsWith(github.event.comment.body, '/merge') || startsWith(github.event.comment.body, '/automerge') || startsWith(github.event.comment.body, '/remerge')))
+      (github.event_name == 'issue_comment' && github.event.action == 'created' && (startsWith(github.event.comment.body, '/merge') || startsWith(github.event.comment.body, '/automerge')))
     runs-on: ubuntu-latest
     steps:
       - name: Resolve PR number(s) to evaluate
@@ -71,6 +77,7 @@ jobs:
         run: |
           set +e -uo pipefail
           nums=""
+          force=0
           case "$EVENT" in
             pull_request|pull_request_review)
               nums=$(jq -r '.pull_request.number // empty' "$GITHUB_EVENT_PATH")
@@ -89,13 +96,26 @@ jobs:
               if [ "$is_pr" != "true" ]; then
                 echo "Comment not on a PR; skip."
                 echo "nums=" >> "$GITHUB_OUTPUT"
+                echo "force=0" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
+              cmd=$(jq -r '.comment.body' "$GITHUB_EVENT_PATH" | awk '{print $1}')
               commenter=$(jq -r '.comment.user.login' "$GITHUB_EVENT_PATH")
               perm=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$commenter/permission" --jq .permission 2>/dev/null || echo none)
-              case "$perm" in
-                admin|maintain) nums=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH") ;;
-                *) echo "Commenter $commenter ($perm) not authorised to /merge; skip." ;;
+              case "$cmd" in
+                /merge-force|/force-merge)
+                  case "$perm" in
+                    admin) echo "Admin force-merge requested by $commenter."; nums=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH"); force=1 ;;
+                    *) echo "Only admins can force-merge. $commenter is $perm; skip." ;;
+                  esac
+                  ;;
+                /merge|/automerge|/remerge)
+                  case "$perm" in
+                    admin|maintain) nums=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH") ;;
+                    *) echo "Commenter $commenter ($perm) not authorised to /merge; skip." ;;
+                  esac
+                  ;;
+                *) echo "Not a recognised merge command ($cmd); skip." ;;
               esac
               ;;
             workflow_dispatch)
@@ -103,14 +123,18 @@ jobs:
               [[ "$nums" =~ ^[0-9]+$ ]] || { echo "Invalid pr_number input '$nums'."; nums=""; }
               ;;
           esac
-          echo "Resolved PRs: ${nums:-<none>}"
+          echo "Resolved PRs: ${nums:-<none>} (force=$force)"
           echo "nums=$nums" >> "$GITHUB_OUTPUT"
+          echo "force=$force" >> "$GITHUB_OUTPUT"
 
       - name: Evaluate and merge
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           NUMS: ${{ steps.pr.outputs.nums }}
+          FORCE: ${{ steps.pr.outputs.force }}
+          # Optional admin token for /merge-force to bypass branch protection.
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
         run: |
           set +e -uo pipefail
 
@@ -142,9 +166,9 @@ jobs:
           }
 
           evaluate() {
-            local pr="$1"
+            local pr="$1" force="${2:-0}"
             echo "::group::PR #$pr"
-            local base head headref state isdraft method
+            local base head headref state isdraft method minappr
             base=$(gh pr view "$pr" --json baseRefName --jq .baseRefName)
             case "$base" in
               dev)  method=squash ;;
@@ -159,6 +183,41 @@ jobs:
 
             head=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
             headref=$(gh pr view "$pr" --json headRefName --jq .headRefName)
+            minappr=$(min_approvals "$base")
+
+            # Post an intro summary once per managed PR.
+            post_once "$pr" "intro" "🤖 **Auto Merge** is active (base: \`$base\`, method: \`$method\`).
+
+          It will merge automatically once:
+          - all checks are green
+          - at least **$minappr** approval(s)
+          - no unresolved review threads
+
+          Comments: \`/merge\` to re-check & merge (admin/maintainer), \`/merge-force\` to merge ignoring all gates (admin only)."
+
+            # Admin force-merge: bypass all gates.
+            if [ "$force" = "1" ]; then
+              local del=""
+              case "$headref" in dev|main) ;; *) del="--delete-branch" ;; esac
+              echo "Admin force-merge requested; ignoring all gates."
+              local rc=0 out
+              if [ -n "$ADMIN_TOKEN" ]; then
+                out=$(GH_TOKEN="$ADMIN_TOKEN" gh pr merge "$pr" --"$method" $del --admin 2>&1) || rc=$?
+              else
+                out=$(gh pr merge "$pr" --"$method" $del --admin 2>&1) || rc=$?
+              fi
+              if [ "$rc" -eq 0 ]; then
+                echo "✅ Force-merged PR #$pr ($method)."
+              else
+                echo "❌ Force merge failed (rc=$rc): $out"
+                post_once "$pr" "merge-failed" "❌ Admin force-merge failed:
+          \`\`\`
+          $out
+          \`\`\`
+          The merge token needs admin rights to bypass branch protection."
+              fi
+              echo "::endgroup::"; return 0
+            fi
 
             # Mergeability: handle conflicts / behind / unknown before gating.
             local mss
@@ -204,8 +263,7 @@ jobs:
             [ "$failed" -eq 0 ] || { echo "Checks failing; not merging."; echo "::endgroup::"; return 0; }
 
             # Gate 2: approvals >= what the base branch requires, 0 changes requested.
-            local minappr approved=0 changes=0
-            minappr=$(min_approvals "$base")
+            local approved=0 changes=0
             while read -r s; do
               case "$s" in
                 APPROVED) approved=$((approved+1)) ;;
@@ -241,5 +299,5 @@ jobs:
 
           [ -n "$NUMS" ] || { echo "No PRs to evaluate."; exit 0; }
           for n in $NUMS; do
-            evaluate "$n" || true
+            evaluate "$n" "$FORCE" || true
           done
