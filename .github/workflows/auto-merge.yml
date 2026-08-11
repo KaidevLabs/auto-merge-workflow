@@ -209,12 +209,8 @@ jobs:
               if [ "$rc" -eq 0 ]; then
                 echo "✅ Force-merged PR #$pr ($method)."
               else
-                echo "❌ Force merge failed (rc=$rc): $out"
-                post_once "$pr" "merge-failed" "❌ Admin force-merge failed:
-          \`\`\`
-          $out
-          \`\`\`
-          The merge token needs admin rights to bypass branch protection."
+                echo "❌ Admin force-merge failed. Resolve the issue and comment /merge-force to retry."
+                post_once "$pr" "merge-failed" "❌ Admin force-merge failed. Resolve the issue and comment \`/merge-force\` to retry."
               fi
               echo "::endgroup::"; return 0
             fi
@@ -287,12 +283,8 @@ jobs:
             if err=$(gh pr merge "$pr" --"$method" $del 2>&1); then
               echo "✅ Merged PR #$pr ($method)."
             else
-              echo "❌ Merge failed: $err"
-              post_once "$pr" "merge-failed" "❌ Auto-merge could not merge this PR:
-          \`\`\`
-          $err
-          \`\`\`
-          Resolve the issue and comment \`/merge\` to retry."
+              echo "❌ Auto-merge could not merge this PR. Resolve the issue and comment /merge to retry."
+              post_once "$pr" "merge-failed" "❌ Auto-merge could not merge this PR. Resolve the issue and comment \`/merge\` to retry."
             fi
             echo "::endgroup::"
           }
