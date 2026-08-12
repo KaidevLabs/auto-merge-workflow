@@ -155,10 +155,18 @@ jobs:
             local branch="$1" r b
             r=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$branch" \
                 --jq '[.[] | select(.type=="pull_request") | (.parameters.required_approving_review_count // 0)] | (if length>0 then max else 0 end)' 2>/dev/null)
-            case "$r" in ''|*[!0-9]*) r=0 ;; esac
+            case "$r" in ''|*[!0-9]*) r="" ;; esac
             b=$(gh api "repos/$GITHUB_REPOSITORY/branches/$branch/protection" \
                 --jq '.required_pull_request_reviews.required_approving_review_count // 0' 2>/dev/null)
-            case "$b" in ''|*[!0-9]*) b=0 ;; esac
+            case "$b" in ''|*[!0-9]*) b="" ;; esac
+            if [ -z "$r" ] && [ -z "$b" ]; then
+              # Protection config unreadable (403/rate-limit/etc): fail closed
+              # by demanding an unreachable number of approvals.
+              echo 999999
+              return 0
+            fi
+            r=${r:-0}
+            b=${b:-0}
             if [ "$r" -ge "$b" ]; then echo "$r"; else echo "$b"; fi
           }
 
