@@ -220,6 +220,13 @@ jobs:
               echo "::endgroup::"; return 0
             fi
 
+            # Skip cross-repo (fork) PRs unless an admin force-merges.
+            if [ "$(gh pr view "$pr" --json isCrossRepository --jq .isCrossRepository 2>/dev/null)" = "true" ]; then
+              echo "Cross-repo (fork) PR; not auto-merging (supply-chain safety)."
+              post_once "$pr" "fork" "⚠️ Auto-merge skipped: this is a forked (cross-repo) PR. An admin can use \`/merge-force\`."
+              echo "::endgroup::"; return 0
+            fi
+
             # Mergeability: handle conflicts / behind / unknown before gating.
             local mss
             mss=$(gh pr view "$pr" --json mergeStateStatus --jq .mergeStateStatus)
