@@ -275,9 +275,22 @@ jobs:
             [ "$approved" -ge "$minappr" ] || { echo "Only $approved approval(s); need $minappr; not merging."; echo "::endgroup::"; return 0; }
 
             # Gate 3: no unresolved review threads (GraphQL; REST has no threads endpoint).
-            local unresolved
-            unresolved=$(gh api graphql -f query="query{repository(owner:\"$owner\",name:\"$name\"){pullRequest(number:$pr){reviewThreads(first:100){nodes{isResolved}}}}}" \
-              --jq '.data.repository.pullRequest.reviewThreads.nodes | map(select(.isResolved == false)) | length' 2>/dev/null || echo 0)
+            local unresolved=0 cursor=""
+            while :; do
+              local out count has_more end
+              out=$(gh api graphql -f query="query{repository(owner:\"$owner\",name:\"$name\"){pullRequest(number:$pr){reviewThreads(first:100${cursor:+ ,after:\"$cursor\"}){nodes{isResolved}pageInfo{hasNextPage endCursor}}}}}" \
+                   --jq '.data.repository.pullRequest.reviewThreads // empty' 2>/dev/null) || {
+                echo "Could not read review threads (API error); not merging."
+                echo "::endgroup::"; return 0
+              }
+              [ -n "$out" ] || break
+              count=$(jq -r '[.nodes[] | select(.isResolved == false)] | length' <<< "$out")
+              unresolved=$((unresolved + count))
+              has_more=$(jq -r '.pageInfo.hasNextPage // "false"' <<< "$out")
+              end=$(jq -r '.pageInfo.endCursor // ""' <<< "$out")
+              [ "$has_more" = "true" ] && [ -n "$end" ] || break
+              cursor="$end"
+            done
             [ "$unresolved" -eq 0 ] || { echo "$unresolved unresolved thread(s); not merging."; echo "::endgroup::"; return 0; }
 
             # All gates passed: merge.
