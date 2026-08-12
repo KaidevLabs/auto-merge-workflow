@@ -155,10 +155,18 @@ jobs:
             local branch="$1" r b
             r=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$branch" \
                 --jq '[.[] | select(.type=="pull_request") | (.parameters.required_approving_review_count // 0)] | (if length>0 then max else 0 end)' 2>/dev/null)
-            case "$r" in ''|*[!0-9]*) r=0 ;; esac
+            case "$r" in ''|*[!0-9]*) r="" ;; esac
             b=$(gh api "repos/$GITHUB_REPOSITORY/branches/$branch/protection" \
                 --jq '.required_pull_request_reviews.required_approving_review_count // 0' 2>/dev/null)
-            case "$b" in ''|*[!0-9]*) b=0 ;; esac
+            case "$b" in ''|*[!0-9]*) b="" ;; esac
+            if [ -z "$r" ] && [ -z "$b" ]; then
+              # Protection config unreadable (403/rate-limit/etc): fail closed
+              # by demanding an unreachable number of approvals.
+              echo 999999
+              return 0
+            fi
+            r=${r:-0}
+            b=${b:-0}
             if [ "$r" -ge "$b" ]; then echo "$r"; else echo "$b"; fi
           }
 
@@ -237,23 +245,24 @@ jobs:
             esac
 
             # Gate 1: every check run on the head SHA must be green/skipped/neutral.
-            local pending=0 failed=0
+            local pending=0 failed=0 failed_names=""
             while IFS=$'\t' read -r cname cstatus cconcl; do
               [ -n "$cname" ] || continue
               case "$cstatus" in
                 completed)
                   case "$cconcl" in
                     success|skipped|neutral) echo "  ok   $cname" ;;
-                    *) echo "  fail $cname ($cconcl)"; failed=1 ;;
+                    *) echo "  fail $cname ($cconcl)"; failed=1; failed_names="$failed_names $cname($cconcl)" ;;
                   esac
                   ;;
                 *) echo "  wait $cname ($cstatus)"; pending=1 ;;
               esac
             done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$head/check-runs" \
-                        --arg runid "$GITHUB_RUN_ID" \
-                        --jq '.check_runs[] | select((.html_url | contains("/" + $runid + "/")) | not) | [.name,.status,(.conclusion // "")] | @tsv' 2>/dev/null || true)
+                        --jq '.check_runs[] | select(.name != "Auto Merge") | [.name,.status,(.conclusion // "")] | @tsv' 2>/dev/null || true)
             [ "$pending" -eq 0 ] || { echo "Checks pending; will retry on next check_run."; echo "::endgroup::"; return 0; }
-            [ "$failed" -eq 0 ] || { echo "Checks failing; not merging."; echo "::endgroup::"; return 0; }
+            [ "$failed" -eq 0 ] || { echo "Checks failing; not merging."
+              post_once "$pr" "blocked-checks" "⚠️ Auto-merge is blocked: failing check(s):\n${failed_names# }"
+              echo "::endgroup::"; return 0; }
 
             # Gate 2: approvals >= what the base branch requires, 0 changes requested.
             local approved=0 changes=0
@@ -263,14 +272,33 @@ jobs:
                 CHANGES_REQUESTED) changes=$((changes+1)) ;;
               esac
             done < <(gh pr view "$pr" --json reviews --jq '.reviews[].state' 2>/dev/null || true)
-            [ "$changes" -eq 0 ] || { echo "Changes requested; not merging."; echo "::endgroup::"; return 0; }
-            [ "$approved" -ge "$minappr" ] || { echo "Only $approved approval(s); need $minappr; not merging."; echo "::endgroup::"; return 0; }
+            [ "$changes" -eq 0 ] || { echo "Changes requested; not merging."
+              post_once "$pr" "blocked-changes" "⚠️ Auto-merge is blocked: changes were requested on this PR."
+              echo "::endgroup::"; return 0; }
+            [ "$approved" -ge "$minappr" ] || { echo "Only $approved approval(s); need $minappr; not merging."
+              post_once "$pr" "blocked-approvals" "⚠️ Auto-merge is blocked: only $approved of $minappr required approval(s)."
+              echo "::endgroup::"; return 0; }
 
             # Gate 3: no unresolved review threads (GraphQL; REST has no threads endpoint).
-            local unresolved
-            unresolved=$(gh api graphql -f query="query{repository(owner:\"$owner\",name:\"$name\"){pullRequest(number:$pr){reviewThreads(first:100){nodes{isResolved}}}}}" \
-              --jq '.data.repository.pullRequest.reviewThreads.nodes | map(select(.isResolved == false)) | length' 2>/dev/null || echo 0)
-            [ "$unresolved" -eq 0 ] || { echo "$unresolved unresolved thread(s); not merging."; echo "::endgroup::"; return 0; }
+            local unresolved=0 cursor=""
+            while :; do
+              local out count has_more end
+              out=$(gh api graphql -f query="query{repository(owner:\"$owner\",name:\"$name\"){pullRequest(number:$pr){reviewThreads(first:100${cursor:+ ,after:\"$cursor\"}){nodes{isResolved}pageInfo{hasNextPage endCursor}}}}}" \
+                   --jq '.data.repository.pullRequest.reviewThreads // empty' 2>/dev/null) || {
+                echo "Could not read review threads (API error); not merging."
+                echo "::endgroup::"; return 0
+              }
+              [ -n "$out" ] || break
+              count=$(jq -r '[.nodes[] | select(.isResolved == false)] | length' <<< "$out")
+              unresolved=$((unresolved + count))
+              has_more=$(jq -r '.pageInfo.hasNextPage // "false"' <<< "$out")
+              end=$(jq -r '.pageInfo.endCursor // ""' <<< "$out")
+              [ "$has_more" = "true" ] && [ -n "$end" ] || break
+              cursor="$end"
+            done
+            [ "$unresolved" -eq 0 ] || { echo "$unresolved unresolved thread(s); not merging."
+              post_once "$pr" "blocked-threads" "⚠️ Auto-merge is blocked: $unresolved unresolved review thread(s)."
+              echo "::endgroup::"; return 0; }
 
             # All gates passed: merge.
             echo "All gates passed; merging with method '$method'."
