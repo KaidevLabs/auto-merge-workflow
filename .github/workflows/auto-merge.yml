@@ -254,7 +254,8 @@ jobs:
             # Gate 1: every check run on the head SHA must be green/skipped/neutral.
             local checkdata
             checkdata=$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$head/check-runs" \
-                          --jq '.check_runs[] | select(.name != "Auto Merge") | [.name,.status,(.conclusion // "")] | @tsv' 2>/dev/null) || {
+                          --arg runid "$GITHUB_RUN_ID" \
+                          --jq '.check_runs[] | select((.name | ascii_downcase) != "auto-merge" and ((.html_url | contains("/" + $runid + "/")) | not)) | [.name,.status,(.conclusion // "")] | @tsv' 2>/dev/null) || {
               echo "Could not read check-runs (API error); not merging (fail closed)."
               echo "::endgroup::"; return 0
             }
