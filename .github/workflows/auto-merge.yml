@@ -245,14 +245,14 @@ jobs:
             esac
 
             # Gate 1: every check run on the head SHA must be green/skipped/neutral.
-            local pending=0 failed=0
+            local pending=0 failed=0 failed_names=""
             while IFS=$'\t' read -r cname cstatus cconcl; do
               [ -n "$cname" ] || continue
               case "$cstatus" in
                 completed)
                   case "$cconcl" in
                     success|skipped|neutral) echo "  ok   $cname" ;;
-                    *) echo "  fail $cname ($cconcl)"; failed=1 ;;
+                    *) echo "  fail $cname ($cconcl)"; failed=1; failed_names="$failed_names $cname($cconcl)" ;;
                   esac
                   ;;
                 *) echo "  wait $cname ($cstatus)"; pending=1 ;;
@@ -260,7 +260,9 @@ jobs:
             done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$head/check-runs" \
                         --jq '.check_runs[] | select(.name != "Auto Merge") | [.name,.status,(.conclusion // "")] | @tsv' 2>/dev/null || true)
             [ "$pending" -eq 0 ] || { echo "Checks pending; will retry on next check_run."; echo "::endgroup::"; return 0; }
-            [ "$failed" -eq 0 ] || { echo "Checks failing; not merging."; echo "::endgroup::"; return 0; }
+            [ "$failed" -eq 0 ] || { echo "Checks failing; not merging."
+              post_once "$pr" "blocked-checks" "⚠️ Auto-merge is blocked: failing check(s):\n${failed_names# }"
+              echo "::endgroup::"; return 0; }
 
             # Gate 2: approvals >= what the base branch requires, 0 changes requested.
             local approved=0 changes=0
@@ -270,8 +272,12 @@ jobs:
                 CHANGES_REQUESTED) changes=$((changes+1)) ;;
               esac
             done < <(gh pr view "$pr" --json reviews --jq '.reviews[].state' 2>/dev/null || true)
-            [ "$changes" -eq 0 ] || { echo "Changes requested; not merging."; echo "::endgroup::"; return 0; }
-            [ "$approved" -ge "$minappr" ] || { echo "Only $approved approval(s); need $minappr; not merging."; echo "::endgroup::"; return 0; }
+            [ "$changes" -eq 0 ] || { echo "Changes requested; not merging."
+              post_once "$pr" "blocked-changes" "⚠️ Auto-merge is blocked: changes were requested on this PR."
+              echo "::endgroup::"; return 0; }
+            [ "$approved" -ge "$minappr" ] || { echo "Only $approved approval(s); need $minappr; not merging."
+              post_once "$pr" "blocked-approvals" "⚠️ Auto-merge is blocked: only $approved of $minappr required approval(s)."
+              echo "::endgroup::"; return 0; }
 
             # Gate 3: no unresolved review threads (GraphQL; REST has no threads endpoint).
             local unresolved=0 cursor=""
@@ -290,7 +296,9 @@ jobs:
               [ "$has_more" = "true" ] && [ -n "$end" ] || break
               cursor="$end"
             done
-            [ "$unresolved" -eq 0 ] || { echo "$unresolved unresolved thread(s); not merging."; echo "::endgroup::"; return 0; }
+            [ "$unresolved" -eq 0 ] || { echo "$unresolved unresolved thread(s); not merging."
+              post_once "$pr" "blocked-threads" "⚠️ Auto-merge is blocked: $unresolved unresolved review thread(s)."
+              echo "::endgroup::"; return 0; }
 
             # All gates passed: merge.
             echo "All gates passed; merging with method '$method'."
