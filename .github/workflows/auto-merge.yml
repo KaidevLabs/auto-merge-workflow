@@ -252,9 +252,12 @@ jobs:
             esac
 
             # Gate 1: every check run on the head SHA must be green/skipped/neutral.
-            local checkdata
+            local checkdata jqexpr
+            # Exclude this workflow's own check run (named after the job,
+            # "auto-merge") and the current run ID so it cannot block itself.
+            jqexpr='.check_runs[] | select(((.name | ascii_downcase) != "auto-merge") and ((.html_url | contains("/'$GITHUB_RUN_ID'/")) | not)) | [.name,.status,(.conclusion // "")] | @tsv'
             checkdata=$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$head/check-runs" \
-                          --jq '.check_runs[] | select(.name != "Auto Merge") | [.name,.status,(.conclusion // "")] | @tsv' 2>/dev/null) || {
+                          --jq "$jqexpr" 2>/dev/null) || {
               echo "Could not read check-runs (API error); not merging (fail closed)."
               echo "::endgroup::"; return 0
             }
