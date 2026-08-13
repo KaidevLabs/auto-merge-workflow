@@ -1,42 +1,29 @@
 name: Auto Merge
 
-# Any non-draft PR targeting `dev` or `main` is merged automatically once ALL
-# of these are true:
-#   - every check run on the PR head is green (or skipped/neutral)
-#   - the PR has at least as many approvals as the base branch requires
-#     (read from the branch's ruleset / branch protection), and no
-#     CHANGES_REQUESTED
-#   - no unresolved review threads
-#   - the PR is mergeable (branch auto-updated when behind; conflicts surfaced)
+# Arms GitHub's native auto-merge on any non-draft PR targeting `dev` or
+# `main`. The branch RULESET is the single source of truth for gating --
+# required checks, required approvals, and resolved threads are all enforced
+# by GitHub, not re-checked here. This workflow's only job is to pick the
+# merge method from the base branch and arm auto-merge; GitHub merges the
+# moment the ruleset is satisfied.
 #
-# The required approval count is NOT hardcoded: it is read from the base
-# branch's ruleset (or legacy branch protection), so it always matches the
-# repo's own configuration.
-#
-# Merge method is derived from the base branch:
 #   - dev  -> squash
 #   - main -> merge commit
 #
 # Comment commands on a PR:
-#   - /merge        re-check and merge if all gates pass (admin/maintainer)
-#   - /merge-force  merge immediately, ignoring all gates (admin only)
+#   - /merge        re-arm auto-merge (admin/maintainer)
+#   - /merge-force  merge immediately, bypassing the ruleset (admin only)
 #
-# The workflow posts an intro summary comment on each managed PR.
-#
-# Triggers (re-evaluate on any relevant state change):
-#   - pull_request: synchronize / ready_for_review / reopened
-#   - pull_request_review: submitted        (approval also kicks off the merge)
-#   - check_run: completed                  (re-evaluates as checks finish)
-#   - issue_comment: /merge* comment        (manual re-trigger)
-#   - workflow_dispatch: PR number input    (manual re-trigger from Actions tab)
-
+# Triggers:
+#   - pull_request: opened / synchronize / ready_for_review / reopened
+#   - pull_request_review: submitted   (re-arms if auto-merge was cleared)
+#   - issue_comment: /merge* comment   (manual re-trigger)
+#   - workflow_dispatch: PR number input (manual re-trigger from Actions tab)
 on:
   pull_request:
-    types: [synchronize, ready_for_review, reopened]
+    types: [opened, synchronize, ready_for_review, reopened]
   pull_request_review:
     types: [submitted]
-  check_run:
-    types: [completed]
   issue_comment:
     types: [created]
   workflow_dispatch:
@@ -49,12 +36,11 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  checks: read
 
 concurrency:
   # Per-PR group so different PRs evaluate in parallel; stale evaluations for
   # the same PR are cancelled by newer ones.
-  group: auto-merge-${{ github.event.pull_request.number || github.event.check_run.check_suite.pull_requests[0].number || github.event.issue.number || inputs.pr_number || 'adhoc' }}
+  group: auto-merge-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number || 'adhoc' }}
   cancel-in-progress: true
 
 jobs:
@@ -78,14 +64,6 @@ jobs:
           case "$EVENT" in
             pull_request|pull_request_review)
               nums=$(jq -r '.pull_request.number // empty' "$GITHUB_EVENT_PATH")
-              ;;
-            check_run)
-              # Skip our own check runs to avoid a self-trigger loop.
-              name=$(jq -r '.check_run.name // ""' "$GITHUB_EVENT_PATH")
-              case "$name" in
-                auto-merge|Auto\ Merge|*"Auto Merge"*) echo "Self-trigger ($name); skip." ;;
-                *) nums=$(jq -r '.check_run.check_suite.pull_requests[0].number // empty' "$GITHUB_EVENT_PATH") ;;
-              esac
               ;;
             issue_comment)
               # Only comments on PRs (not issues).
@@ -124,7 +102,7 @@ jobs:
           echo "nums=$nums" >> "$GITHUB_OUTPUT"
           echo "force=$force" >> "$GITHUB_OUTPUT"
 
-      - name: Evaluate and merge
+      - name: Arm auto-merge
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -134,9 +112,6 @@ jobs:
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
         run: |
           set +e -uo pipefail
-
-          owner=${GITHUB_REPOSITORY%%/*}
-          name=${GITHUB_REPOSITORY#*/}
 
           # Post a PR comment only if one with the same marker doesn't already exist.
           post_once() {
@@ -149,31 +124,10 @@ jobs:
           $body" 2>/dev/null || true
           }
 
-          # Required approving reviews for a branch, read from the repo config:
-          # rulesets (max across them) with a legacy branch-protection fallback.
-          min_approvals() {
-            local branch="$1" r b
-            r=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$branch" \
-                --jq '[.[] | select(.type=="pull_request") | (.parameters.required_approving_review_count // 0)] | (if length>0 then max else 0 end)' 2>/dev/null)
-            case "$r" in ''|*[!0-9]*) r="" ;; esac
-            b=$(gh api "repos/$GITHUB_REPOSITORY/branches/$branch/protection" \
-                --jq '.required_pull_request_reviews.required_approving_review_count // 0' 2>/dev/null)
-            case "$b" in ''|*[!0-9]*) b="" ;; esac
-            if [ -z "$r" ] && [ -z "$b" ]; then
-              # Protection config unreadable (403/rate-limit/etc): fail closed
-              # by demanding an unreachable number of approvals.
-              echo 999999
-              return 0
-            fi
-            r=${r:-0}
-            b=${b:-0}
-            if [ "$r" -ge "$b" ]; then echo "$r"; else echo "$b"; fi
-          }
-
           evaluate() {
             local pr="$1" force="${2:-0}"
             echo "::group::PR #$pr"
-            local base head headref state isdraft method minappr
+            local base headref state isdraft method
             base=$(gh pr view "$pr" --json baseRefName --jq .baseRefName)
             case "$base" in
               dev)  method=squash ;;
@@ -186,25 +140,33 @@ jobs:
             [ "$state" = "OPEN" ] || { echo "PR is $state; skip."; echo "::endgroup::"; return 0; }
             [ "$isdraft" = "false" ] || { echo "Draft; skip."; echo "::endgroup::"; return 0; }
 
-            head=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
             headref=$(gh pr view "$pr" --json headRefName --jq .headRefName)
-            minappr=$(min_approvals "$base")
+            local del=""
+            case "$headref" in dev|main) ;; *) del="--delete-branch" ;; esac
+
+            # Read the ruleset config once, purely so the intro is informative
+            # (it is NOT used for gating -- the ruleset itself enforces it).
+            local appr reqchecks am_on warn=""
+            appr=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$base" \
+                   --jq '[.[]|select(.type=="pull_request")|(.parameters.required_approving_review_count // 0)]|(if length>0 then max else 0 end)' 2>/dev/null)
+            reqchecks=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$base" \
+                   --jq '[.[]|select(.type=="required_status_checks")|.parameters.required_status_checks[].context]|join(", ")' 2>/dev/null)
+            am_on=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.allow_auto_merge' 2>/dev/null)
+            [ "$am_on" = "true" ] || warn="> ⚠️ **Auto-merge is disabled on this repo** (\`allow_auto_merge: false\`) — no PR can be armed until an admin enables it (Settings → General → Pull Requests)."$'\n\n'
 
             # Post an intro summary once per managed PR.
-            post_once "$pr" "intro" "🤖 **Auto Merge** is active (base: \`$base\`, method: \`$method\`).
+            post_once "$pr" "intro" "${warn}🤖 **Auto Merge** (base: \`$base\` → \`$method\`)
 
-          It will merge automatically once:
-          - all checks are green
-          - at least **$minappr** approval(s)
-          - no unresolved review threads
+          This PR will be armed for GitHub auto-merge, which merges automatically once the \`$base\` ruleset is satisfied:
+          - approvals required: **${appr:-0}**
+          - required checks: ${reqchecks:-none}
+          - review threads resolved
 
-          Comments: \`/merge\` to re-check & merge (admin/maintainer), \`/merge-force\` to merge ignoring all gates (admin only)."
+          Comments: \`/merge\` to re-arm (admin/maintainer), \`/merge-force\` to merge now, bypassing the ruleset (admin only)."
 
-            # Admin force-merge: bypass all gates.
+            # Admin force-merge: bypass the ruleset and merge immediately.
             if [ "$force" = "1" ]; then
-              local del=""
-              case "$headref" in dev|main) ;; *) del="--delete-branch" ;; esac
-              echo "Admin force-merge requested; ignoring all gates."
+              echo "Admin force-merge requested; bypassing ruleset."
               local rc=0 out
               if [ -n "$ADMIN_TOKEN" ]; then
                 out=$(GH_TOKEN="$ADMIN_TOKEN" gh pr merge "$pr" --"$method" $del --admin 2>&1) || rc=$?
@@ -227,7 +189,8 @@ jobs:
               echo "::endgroup::"; return 0
             fi
 
-            # Mergeability: handle conflicts / behind / unknown before gating.
+            # Mergeability: conflicts need manual resolution; a behind branch is
+            # updated (strict rulesets require the head to be up to date).
             local mss
             mss=$(gh pr view "$pr" --json mergeStateStatus --jq .mergeStateStatus)
             case "$mss" in
@@ -251,90 +214,18 @@ jobs:
                 ;;
             esac
 
-            # Gate 1: every check run on the head SHA must be green/skipped/neutral.
-            local checkdata jqexpr
-            # Exclude this workflow's own check run (named after the job,
-            # "auto-merge") and the current run ID so it cannot block itself.
-            jqexpr='.check_runs[] | select(((.name | ascii_downcase) != "auto-merge") and ((.html_url | contains("/'$GITHUB_RUN_ID'/")) | not)) | [.name,.status,(.conclusion // "")] | @tsv'
-            checkdata=$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$head/check-runs" \
-                          --jq "$jqexpr" 2>/dev/null) || {
-              echo "Could not read check-runs (API error); not merging (fail closed)."
+            # Arm GitHub auto-merge. The ruleset is the gatekeeper from here.
+            if [ "$(gh pr view "$pr" --json autoMergeRequest --jq '.autoMergeRequest != null' 2>/dev/null)" = "true" ]; then
+              echo "Auto-merge already armed for PR #$pr."
               echo "::endgroup::"; return 0
-            }
-            local pending=0 failed=0 failed_names=""
-            while IFS=$'\t' read -r cname cstatus cconcl; do
-              [ -n "$cname" ] || continue
-              case "$cstatus" in
-                completed)
-                  case "$cconcl" in
-                    success|skipped|neutral) echo "  ok   $cname" ;;
-                    *) echo "  fail $cname ($cconcl)"; failed=1; failed_names="$failed_names $cname($cconcl)" ;;
-                  esac
-                  ;;
-                *) echo "  wait $cname ($cstatus)"; pending=1 ;;
-              esac
-            done <<< "$checkdata"
-            [ "$pending" -eq 0 ] || { echo "Checks pending; will retry on next check_run."; echo "::endgroup::"; return 0; }
-            [ "$failed" -eq 0 ] || { echo "Checks failing; not merging."
-              post_once "$pr" "blocked-checks" "⚠️ Auto-merge is blocked: failing check(s):\n${failed_names# }"
-              echo "::endgroup::"; return 0; }
-
-            # Legacy commit status contexts (combined).
-            local legacy_status
-            legacy_status=$(gh api "repos/$GITHUB_REPOSITORY/commits/$head/status" --jq '.state' 2>/dev/null)
-            case "$legacy_status" in
-              pending) echo "Legacy commit status pending; not merging."; echo "::endgroup::"; return 0 ;;
-              success) : ;;
-              failure|error) echo "Legacy commit status $legacy_status; not merging."; echo "::endgroup::"; return 0 ;;
-              *) echo "Could not read commit status ('$legacy_status'); not merging (fail closed)."; echo "::endgroup::"; return 0 ;;
-            esac
-
-            # Gate 2: approvals >= what the base branch requires, 0 changes requested.
-            local approved=0 changes=0
-            while read -r s; do
-              case "$s" in
-                APPROVED) approved=$((approved+1)) ;;
-                CHANGES_REQUESTED) changes=$((changes+1)) ;;
-              esac
-            done < <(gh pr view "$pr" --json reviews --jq '.reviews[].state' 2>/dev/null || true)
-            [ "$changes" -eq 0 ] || { echo "Changes requested; not merging."
-              post_once "$pr" "blocked-changes" "⚠️ Auto-merge is blocked: changes were requested on this PR."
-              echo "::endgroup::"; return 0; }
-            [ "$approved" -ge "$minappr" ] || { echo "Only $approved approval(s); need $minappr; not merging."
-              post_once "$pr" "blocked-approvals" "⚠️ Auto-merge is blocked: only $approved of $minappr required approval(s)."
-              echo "::endgroup::"; return 0; }
-
-            # Gate 3: no unresolved review threads (GraphQL; REST has no threads endpoint).
-            local unresolved=0 cursor=""
-            while :; do
-              local out count has_more end
-              out=$(gh api graphql -f query="query{repository(owner:\"$owner\",name:\"$name\"){pullRequest(number:$pr){reviewThreads(first:100${cursor:+ ,after:\"$cursor\"}){nodes{isResolved}pageInfo{hasNextPage endCursor}}}}}" \
-                   --jq '.data.repository.pullRequest.reviewThreads // empty' 2>/dev/null) || {
-                echo "Could not read review threads (API error); not merging."
-                echo "::endgroup::"; return 0
-              }
-              [ -n "$out" ] || break
-              count=$(jq -r '[.nodes[] | select(.isResolved == false)] | length' <<< "$out")
-              unresolved=$((unresolved + count))
-              has_more=$(jq -r '.pageInfo.hasNextPage // "false"' <<< "$out")
-              end=$(jq -r '.pageInfo.endCursor // ""' <<< "$out")
-              [ "$has_more" = "true" ] && [ -n "$end" ] || break
-              cursor="$end"
-            done
-            [ "$unresolved" -eq 0 ] || { echo "$unresolved unresolved thread(s); not merging."
-              post_once "$pr" "blocked-threads" "⚠️ Auto-merge is blocked: $unresolved unresolved review thread(s)."
-              echo "::endgroup::"; return 0; }
-
-            # All gates passed: merge.
-            echo "All gates passed; merging with method '$method'."
-            local del=""
-            case "$headref" in dev|main) ;; *) del="--delete-branch" ;; esac
+            fi
+            echo "Arming auto-merge with method '$method'."
             local err
-            if err=$(gh pr merge "$pr" --"$method" $del 2>&1); then
-              echo "✅ Merged PR #$pr ($method)."
+            if err=$(gh pr merge "$pr" --auto --"$method" $del 2>&1); then
+              echo "✅ Auto-merge armed for PR #$pr ($method); GitHub will merge when the ruleset is satisfied."
             else
-              echo "❌ Auto-merge could not merge this PR. Resolve the issue and comment /merge to retry."
-              post_once "$pr" "merge-failed" "❌ Auto-merge could not merge this PR. Resolve the issue and comment \`/merge\` to retry."
+              echo "❌ Could not arm auto-merge: $err"
+              post_once "$pr" "merge-failed" "❌ Auto-merge could not be armed. Resolve the issue and comment \`/merge\` to retry."
             fi
             echo "::endgroup::"
           }
