@@ -144,10 +144,23 @@ jobs:
             local del=""
             case "$headref" in dev|main) ;; *) del="--delete-branch" ;; esac
 
-            # Post an intro summary once per managed PR.
-            post_once "$pr" "intro" "🤖 **Auto Merge** is active (base: \`$base\`, method: \`$method\`).
+            # Read the ruleset config once, purely so the intro is informative
+            # (it is NOT used for gating -- the ruleset itself enforces it).
+            local appr reqchecks am_on warn=""
+            appr=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$base" \
+                   --jq '[.[]|select(.type=="pull_request")|(.parameters.required_approving_review_count // 0)]|(if length>0 then max else 0 end)' 2>/dev/null)
+            reqchecks=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$base" \
+                   --jq '[.[]|select(.type=="required_status_checks")|.parameters.required_status_checks[].context]|join(", ")' 2>/dev/null)
+            am_on=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.allow_auto_merge' 2>/dev/null)
+            [ "$am_on" = "true" ] || warn="> ⚠️ **Auto-merge is disabled on this repo** (\`allow_auto_merge: false\`) — no PR can be armed until an admin enables it (Settings → General → Pull Requests)."$'\n\n'
 
-          It arms GitHub auto-merge, which merges once the \`$base\` branch ruleset is satisfied (required checks, approvals, resolved threads).
+            # Post an intro summary once per managed PR.
+            post_once "$pr" "intro" "${warn}🤖 **Auto Merge** (base: \`$base\` → \`$method\`)
+
+          This PR will be armed for GitHub auto-merge, which merges automatically once the \`$base\` ruleset is satisfied:
+          - approvals required: **${appr:-0}**
+          - required checks: ${reqchecks:-none}
+          - review threads resolved
 
           Comments: \`/merge\` to re-arm (admin/maintainer), \`/merge-force\` to merge now, bypassing the ruleset (admin only)."
 
