@@ -17,7 +17,7 @@ name: Auto Merge
 # Triggers:
 #   - pull_request: opened / synchronize / ready_for_review / reopened
 #   - pull_request_review: submitted   (re-arms if auto-merge was cleared)
-#   - issue_comment: /merge* comment   (manual re-trigger)
+#   - issue_comment: /merge or /merge-force comment (manual re-trigger)
 #   - workflow_dispatch: PR number input (manual re-trigger from Actions tab)
 on:
   pull_request:
@@ -45,9 +45,17 @@ concurrency:
 
 jobs:
   auto-merge:
+    # Exact commands only: '/merge' or '/merge-force', optionally followed by
+    # args (space-separated). Prefix matching is intentionally NOT used, so
+    # lookalikes such as '/mergeforce' never even start the job; the resolver
+    # below re-checks the first word exactly before acting.
     if: |
       github.event_name != 'issue_comment' ||
-      (github.event_name == 'issue_comment' && github.event.action == 'created' && (startsWith(github.event.comment.body, '/merge') || startsWith(github.event.comment.body, '/automerge')))
+      (github.event_name == 'issue_comment' && github.event.action == 'created' &&
+        (github.event.comment.body == '/merge' ||
+         github.event.comment.body == '/merge-force' ||
+         startsWith(github.event.comment.body, '/merge ') ||
+         startsWith(github.event.comment.body, '/merge-force ')))
     runs-on: ubuntu-latest
     steps:
       - name: Resolve PR number(s) to evaluate
@@ -78,16 +86,16 @@ jobs:
               commenter=$(jq -r '.comment.user.login' "$GITHUB_EVENT_PATH")
               perm=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$commenter/permission" --jq .permission 2>/dev/null || echo none)
               case "$cmd" in
-                /merge-force|/force-merge)
+                /merge-force)
                   case "$perm" in
                     admin) echo "Admin force-merge requested by $commenter."; nums=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH"); force=1 ;;
                     *) echo "Only admins can force-merge. $commenter is $perm; skip." ;;
                   esac
                   ;;
-                /merge|/automerge|/remerge)
+                /merge)
                   case "$perm" in
                     admin|maintain) nums=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH") ;;
-                    *) echo "Commenter $commenter ($perm) not authorised to /merge; skip." ;;
+                    *) echo "Commenter $commenter ($perm) not authorised to run '$cmd'; skip." ;;
                   esac
                   ;;
                 *) echo "Not a recognised merge command ($cmd); skip." ;;
